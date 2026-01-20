@@ -507,6 +507,16 @@ def save_with_accelerate(
             }
         )
 
+    # Fix generation config validation issues (temperature/top_p require do_sample=True)
+    if hasattr(unwrapped_model, "generation_config"):
+        gen_config = unwrapped_model.generation_config
+        if not getattr(gen_config, "do_sample", True):
+            # If do_sample is False, clear sampling-only parameters to avoid validation errors
+            if hasattr(gen_config, "temperature"):
+                gen_config.temperature = None
+            if hasattr(gen_config, "top_p"):
+                gen_config.top_p = None
+
     if use_lora:
         # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
         # and has its own save_pretrained function for only saving lora modules.

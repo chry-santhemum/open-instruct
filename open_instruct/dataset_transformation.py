@@ -1461,8 +1461,10 @@ class DatasetConfig:
 
     def __post_init__(self):
         # if the file exists locally, use the local file
-        if os.path.exists(self.dataset_name) and self.dataset_name.endswith(".jsonl"):
-            assert self.dataset_split == "train", "Only train split is supported for local jsonl files."
+        if os.path.exists(self.dataset_name) and (
+            self.dataset_name.endswith(".jsonl") or self.dataset_name.endswith(".json")
+        ):
+            assert self.dataset_split == "train", "Only train split is supported for local json files."
             self.dataset = load_dataset(
                 "json", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
             )
@@ -1552,6 +1554,10 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         # Always preserve dataset_source if it exists
         if DATASET_ORIGIN_KEY in dataset.column_names and DATASET_ORIGIN_KEY not in target_columns:
             target_columns = target_columns + [DATASET_ORIGIN_KEY]
+        # Preserve flipped and original_index for filtered DPO datasets
+        for field in ["flipped", "original_index"]:
+            if field in dataset.column_names and field not in target_columns:
+                target_columns = target_columns + [field]
 
         if fn_type == "map":
             dataset = dataset.map(
@@ -1814,10 +1820,12 @@ def load_dataset_configs(
     for i in range(0, len(dataset_mixer_list), 2):
         dataset_name = dataset_mixer_list[i]
         frac_or_num_samples = dataset_mixer_list[i + 1]
-        if "." in frac_or_num_samples:
-            frac_or_num_samples = float(frac_or_num_samples)
-        else:
-            frac_or_num_samples = int(frac_or_num_samples)
+        # Handle both string and numeric types from YAML parsing
+        if isinstance(frac_or_num_samples, str):
+            if "." in frac_or_num_samples:
+                frac_or_num_samples = float(frac_or_num_samples)
+            else:
+                frac_or_num_samples = int(frac_or_num_samples)
         # Uses dataset_mixer_list_splits[i] where i increments by 2 (0, 2, 4...). This works because
         # all current usage provides a single split that gets replicated to len(dataset_mixer_list).
         # If different splits per dataset are needed, use dataset_mixer_list_splits[i // 2] instead.
