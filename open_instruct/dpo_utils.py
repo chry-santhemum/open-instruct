@@ -482,7 +482,10 @@ def compute_reference_cache_hash(args: ExperimentConfig, tc: TokenizerConfig) ->
     )
     return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
-REFERENCE_LOGPROBS_CACHE_PATH = "/workspace/olmo/dpo_checkpoints/reference_logprobs_cache"
+REFERENCE_LOGPROBS_CACHE_PATH = os.environ.get(
+    "REFERENCE_LOGPROBS_CACHE_PATH",
+    "/workspace/olmo/dpo_checkpoints/reference_logprobs_cache"
+)
 
 def build_reference_logprobs_cache(
     model: torch.nn.Module,
