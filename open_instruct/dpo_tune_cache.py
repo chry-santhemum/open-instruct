@@ -228,7 +228,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
 
     # Make one log on every process with the configuration for debugging.
     logger_utils.setup_logger()
-    logger.info(accelerator.state, main_process_only=False)
+    logger.info(accelerator.state)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -561,10 +561,13 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
                 use_lora=args.use_lora,
             )
         logger.info("=============after cache logprobs")
-        print_gpu_stats(init_gpu_memory)
-        torch.cuda.empty_cache()
+        print_gpu_stas(init_gpu_memory)
+        torch.cuda.emptty_cache()
         logger.info("=============after cache logprobs; clear cache")
         print_gpu_stats(init_gpu_memory)
+    
+    if args.cache_reference_logprobs_only:
+        return
 
     # Set up profiler if enabled
     profiler = None
@@ -769,7 +772,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
     if profiler is not None:
         profiler.__exit__(None, None, None)
 
-    if args.output_dir is not None and not args.skip_model_save:
+    if args.output_dir is not None and not args.profile:
         model_utils.save_with_accelerate(
             accelerator, model, tokenizer, args.output_dir, args.use_lora, chat_template_name=tc.chat_template_name
         )
@@ -779,7 +782,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
             clean_last_n_checkpoints(args.output_dir, keep_last_n_checkpoints=0)
 
     if (
-        not args.skip_model_save
+        not args.profile
         and args.try_auto_save_to_beaker
         and accelerator.is_main_process
         and is_beaker_job()
@@ -788,7 +791,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
     ):
         shutil.copytree(args.output_dir, "/output", dirs_exist_ok=True)
 
-    if not args.skip_model_save and is_beaker_job() and accelerator.is_main_process and args.try_launch_beaker_eval_jobs:
+    if not args.profile and is_beaker_job() and accelerator.is_main_process and args.try_launch_beaker_eval_jobs:
         launch_ai2_evals_on_weka(
             path=args.output_dir,
             leaderboard_name=args.hf_repo_revision,
@@ -800,7 +803,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
             eval_priority=args.eval_priority,
             oe_eval_gpu_multiplier=args.oe_eval_gpu_multiplier,
         )
-    if not args.skip_model_save and args.push_to_hub and accelerator.is_main_process:
+    if not args.profile and args.push_to_hub and accelerator.is_main_process:
         model_utils.push_folder_to_hub(args.output_dir, args.hf_repo_id, args.hf_repo_revision)
     accelerator.wait_for_everyone()
     if args.with_tracking:

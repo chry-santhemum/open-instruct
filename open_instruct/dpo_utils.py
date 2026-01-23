@@ -170,14 +170,17 @@ class DatasetConfig:
     then modified according to the loaded dataset.
     The loaded dataset should have:
       - a "cache_index" column, corresponding to the index of the dataset
-        used to compute the reference logprobs.
+        used to compute the reference logprobs. This will be used to index
+        into the reference logprobs cache.
       - a boolean "flipped" column, corresponding to whether the sample was flipped.
       - If there are new entries which didn't exist in the original dataset,
         the "cache_index" column should be set to -1,
         and there should also be a "new_index" column,
         which is offsetted from the length of the original cache.
         The reference logprobs will be newly computed. They will not be saved.
-     """
+    """
+    cache_reference_logprobs_only: bool = False
+    """If true, exit after caching and saving the reference logprobs to disk."""
 
 
 @dataclass
@@ -238,6 +241,8 @@ class CheckpointConfig:
     """How many checkpoints to keep in the output directory. -1 for all."""
     resume_from_checkpoint: str | None = None
     """If the training should continue from a checkpoint folder."""
+    skip_model_save: bool = False
+    """Skip saving the model at the end of training."""
 
 
 @dataclass
@@ -653,6 +658,7 @@ def dpo_loss(
     """
     # flip the reference chosen and rejected logps
     # when reference_flip_mask
+
     reference_chosen_logps, reference_rejected_logps = (
         torch.where(reference_flip_mask, reference_rejected_logps, reference_chosen_logps),
         torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps)
@@ -778,22 +784,23 @@ def compute_loss(
         #     try the "cache_index" entry first. if that is -1,
         #     then it is a new entry; try "new_index" + offset instead.
         # Otherwise, just match by the "index".
-        ref_cache_indices = []
-        for ex in batch:
-            if args.reference_logprobs_cache_path is not None:
-                if ex["cache_index"] != -1:
-                    ref_cache_indices.append(ex["cache_index"])
+        if args.reference_logprobs_cache_path is not None:
+            ref_cache_indices = []
+            for i in range(len(batch["cache_index"])):
+                if batch["cache_index"][i] != -1:
+                    ref_cache_indices.append(batch["cache_index"][i])
                 else:
                     assert reference_cache.offset is not None, "New entries are present in the dataset, but reference_cache.offset is not set."
-                    ref_cache_indices.append(ex["new_index"] + reference_cache.offset)
-            else:
-                ref_cache_indices.append(ex["index"])
+                    ref_cache_indices.append(batch["new_index"][i] + reference_cache.offset)
+        else:
+            ref_cache_indices = list(batch["index"])
+        ref_cache_indices = torch.tensor(ref_cache_indices, device=policy_chosen_logps.device)
         ref_logps = reference_cache[ref_cache_indices]
 
         if "flipped" in batch:
-            reference_flip_mask = torch.tensor(batch["flipped"], dtype=torch.bool)
+            reference_flip_mask = torch.tensor(batch["flipped"], dtype=torch.bool, device=policy_chosen_logps.device)
         else:
-            reference_flip_mask = torch.zeros(len(ref_cache_indices), dtype=torch.bool)
+            reference_flip_mask = torch.zeros(len(ref_cache_indices), dtype=torch.bool, device=policy_chosen_logps.device)
 
         return dpo_loss(
             policy_chosen_logps,
