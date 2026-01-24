@@ -464,6 +464,7 @@ class ExperimentConfig(
 
 FlatArguments = ExperimentConfig
 
+
 def compute_reference_cache_hash(args: ExperimentConfig, tc: TokenizerConfig) -> str:
     """Compute deterministic hash for reference logprobs cache from ExperimentConfig."""
     transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
@@ -487,10 +488,11 @@ def compute_reference_cache_hash(args: ExperimentConfig, tc: TokenizerConfig) ->
     )
     return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
+
 REFERENCE_LOGPROBS_CACHE_PATH = os.environ.get(
-    "REFERENCE_LOGPROBS_CACHE_PATH",
-    "/workspace/olmo/dpo_checkpoints/reference_logprobs_cache"
+    "REFERENCE_LOGPROBS_CACHE_PATH", "/workspace/olmo/dpo_checkpoints/reference_logprobs_cache"
 )
+
 
 def build_reference_logprobs_cache(
     model: torch.nn.Module,
@@ -586,11 +588,7 @@ def append_reference_logprobs_cache(
         for batch in tqdm(
             dataloader, disable=not accelerator.is_local_main_process, desc="Caching reference logprobs"
         ):
-            new_indices = [
-                idx
-                for idx, cache_idx in enumerate(batch["cache_index"])
-                if cache_idx == -1
-            ]
+            new_indices = [idx for idx, cache_idx in enumerate(batch["cache_index"]) if cache_idx == -1]
             batch_new = {k: v[new_indices] for k, v in batch.items()}
             if use_lora:
                 with accelerator.unwrap_model(model).disable_adapter():
@@ -615,16 +613,17 @@ def append_reference_logprobs_cache(
         )
 
     model.train()
-    new_cache = model_utils.TensorCache(tensors={
-        "chosen_logps": torch.cat([original_logprobs_cache.tensors["chosen_logps"], chosen_tensor]),
-        "rejected_logps": torch.cat([original_logprobs_cache.tensors["rejected_logps"], rejected_tensor]),
-    })
+    new_cache = model_utils.TensorCache(
+        tensors={
+            "chosen_logps": torch.cat([original_logprobs_cache.tensors["chosen_logps"], chosen_tensor]),
+            "rejected_logps": torch.cat([original_logprobs_cache.tensors["rejected_logps"], rejected_tensor]),
+        }
+    )
 
     if dist.is_initialized():
         dist.barrier()
 
     return new_cache
-
 
 
 def dpo_loss(
@@ -661,7 +660,7 @@ def dpo_loss(
 
     reference_chosen_logps, reference_rejected_logps = (
         torch.where(reference_flip_mask, reference_rejected_logps, reference_chosen_logps),
-        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps)
+        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps),
     )
 
     pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -714,9 +713,9 @@ def wpo_loss(
     # when reference_flip_mask
     reference_chosen_logps, reference_rejected_logps = (
         torch.where(reference_flip_mask, reference_rejected_logps, reference_chosen_logps),
-        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps)
+        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps),
     )
-    
+
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
 
@@ -790,7 +789,9 @@ def compute_loss(
                 if batch["cache_index"][i] != -1:
                     ref_cache_indices.append(batch["cache_index"][i])
                 else:
-                    assert reference_cache.offset is not None, "New entries are present in the dataset, but reference_cache.offset is not set."
+                    assert reference_cache.offset is not None, (
+                        "New entries are present in the dataset, but reference_cache.offset is not set."
+                    )
                     ref_cache_indices.append(batch["new_index"][i] + reference_cache.offset)
         else:
             ref_cache_indices = list(batch["index"])
@@ -800,7 +801,9 @@ def compute_loss(
         if "flipped" in batch:
             reference_flip_mask = torch.tensor(batch["flipped"], dtype=torch.bool, device=policy_chosen_logps.device)
         else:
-            reference_flip_mask = torch.zeros(len(ref_cache_indices), dtype=torch.bool, device=policy_chosen_logps.device)
+            reference_flip_mask = torch.zeros(
+                len(ref_cache_indices), dtype=torch.bool, device=policy_chosen_logps.device
+            )
 
         return dpo_loss(
             policy_chosen_logps,

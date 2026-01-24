@@ -478,21 +478,19 @@ def save_with_accelerate(
     chat_template_name: str = "tulu",
 ) -> None:
     """`model_attribute_to_save` is for used to save PPO's policy instead of the full model"""
-    # set the generation config to an empty setting to be safe.
-    # we usually do greedy decoding for generation, so this should be okay.
-    # otherwise, we get an error thrown at save time.
-    if chat_template_name and "olmo" in chat_template_name:
-        # New chat template has no bos token, and two eos tokens: <|im_end|> and <|endoftext|>
-        logger.info(f"Detected olmo chat template: {chat_template_name}, updating model generation config.")
-        model.generation_config = get_olmo3_generation_config(tokenizer)
-    else:
-        model.generation_config = transformers.GenerationConfig(
-            temperature=None, top_p=None, eos_token_id=tokenizer.eos_token_id, bos_token_id=tokenizer.bos_token_id
-        )
-
     unwrapped_model: transformers.PreTrainedModel = accelerator.unwrap_model(model)
     if model_attribute_to_save is not None:
         unwrapped_model = getattr(unwrapped_model, model_attribute_to_save)
+
+    # Set generation config on the unwrapped model (not the wrapped one) since save_pretrained
+    # is called on unwrapped_model. Setting on wrapped model has no effect.
+    if chat_template_name and "olmo" in chat_template_name:
+        logger.info(f"Detected olmo chat template: {chat_template_name}, updating model generation config.")
+        unwrapped_model.generation_config = get_olmo3_generation_config(tokenizer)
+    else:
+        unwrapped_model.generation_config = transformers.GenerationConfig(
+            temperature=None, top_p=None, eos_token_id=tokenizer.eos_token_id, bos_token_id=tokenizer.bos_token_id
+        )
     # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
     # Otherwise, sometimes the model will be saved with only part of the parameters.
     # Also, accelerator needs to use the wrapped model to get the state_dict.
@@ -508,16 +506,6 @@ def save_with_accelerate(
                 if k.startswith(f"{model_attribute_to_save}.")
             }
         )
-
-    # Fix generation config validation issues (temperature/top_p require do_sample=True)
-    if hasattr(unwrapped_model, "generation_config"):
-        gen_config = unwrapped_model.generation_config
-        if not getattr(gen_config, "do_sample", True):
-            # If do_sample is False, clear sampling-only parameters to avoid validation errors
-            if hasattr(gen_config, "temperature"):
-                gen_config.temperature = None
-            if hasattr(gen_config, "top_p"):
-                gen_config.top_p = None
 
     if use_lora:
         # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process

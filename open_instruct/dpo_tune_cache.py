@@ -561,11 +561,11 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
                 use_lora=args.use_lora,
             )
         logger.info("=============after cache logprobs")
-        print_gpu_stas(init_gpu_memory)
-        torch.cuda.emptty_cache()
+        print_gpu_stats(init_gpu_memory)
+        torch.cuda.empty_cache()
         logger.info("=============after cache logprobs; clear cache")
         print_gpu_stats(init_gpu_memory)
-    
+
     if args.cache_reference_logprobs_only:
         return
 
