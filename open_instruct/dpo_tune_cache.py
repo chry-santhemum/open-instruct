@@ -30,7 +30,6 @@ import random
 import shutil
 import time
 from datetime import timedelta
-from pathlib import Path
 
 import datasets
 import torch
@@ -228,7 +227,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
 
     # Make one log on every process with the configuration for debugging.
     logger_utils.setup_logger()
-    logger.info(accelerator.state)
+    logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -391,15 +390,15 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
     # This is used to allocate tensors for the logprobs cache.
     original_dataset_size = len(train_dataset)
 
-    # Compute the number of entries with "cache_index" column set to -1.
+    # Compute the number of entries with "original_index" column set to -1.
     # This corresponds to the number of entries that are newly added.
     # This is used to compute cached logprobs for the new entries.
     new_dataset_size = 0
     for ex in train_dataset:
-        if ex.get("cache_index", 0) == -1:
-            assert ex.get("new_index", None) is not None
+        if ex.get("original_index", 0) == -1:
+            assert ex.get("new_index") is not None
             new_dataset_size += 1
-    logger.info(f"Newly added, uncached entries: {new_dataset_size}")
+    logger.info(f"Newly added, uncached rows: {new_dataset_size} rows")
 
     if args.max_train_samples is not None:
         max_train_samples = min(len(train_dataset), args.max_train_samples)
@@ -550,6 +549,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
             )
 
         else:
+            logger.info("Building reference logprobs from scratch")
             reference_cache = dpo_utils.build_reference_logprobs_cache(
                 model=model,
                 dataloader=train_dataloader,
@@ -568,31 +568,6 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
 
     if args.cache_reference_logprobs_only:
         return
-
-    # Set up profiler if enabled
-    profiler = None
-    if args.profile:
-        from torch.profiler import ProfilerActivity, profile, schedule
-
-        profile_dir = Path(args.profile_output_dir or os.path.join(args.output_dir, "profiler"))
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
-        def trace_handler(prof):
-            output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30)
-            logger.info(f"Profile by GPU time:\n{output}")
-            trace_path = profile_dir / f"train_step_{prof.step_num}.json.gz"
-            prof.export_chrome_trace(str(trace_path))
-            logger.info(f"Saved trace to {trace_path}")
-
-        profiler = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=1, warmup=2, active=args.profile_steps, repeat=1),
-            on_trace_ready=trace_handler,
-            record_shapes=True,
-            with_stack=False,
-            profile_memory=False,
-        )
-        profiler.__enter__()
 
     # Only show the progress bar once on each machine.
     start_time = time.perf_counter()
@@ -669,8 +644,6 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
-                if profiler is not None:
-                    profiler.step()
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
                     # single all reduce to save time, avoiding per metric all reduce
                     global_metrics_tensor = accelerator.reduce(local_metrics.metrics, reduction="mean")
@@ -769,21 +742,17 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
                 clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
             accelerator.wait_for_everyone()
 
-    if profiler is not None:
-        profiler.__exit__(None, None, None)
-
-    if args.output_dir is not None and not args.profile:
+    if args.output_dir is not None:
         model_utils.save_with_accelerate(
             accelerator, model, tokenizer, args.output_dir, args.use_lora, chat_template_name=tc.chat_template_name
         )
 
-        # remove all checkpoints to save space
-        if accelerator.is_local_main_process:
-            clean_last_n_checkpoints(args.output_dir, keep_last_n_checkpoints=0)
+    # remove all checkpoints to save space
+    if accelerator.is_local_main_process:
+        clean_last_n_checkpoints(args.output_dir, keep_last_n_checkpoints=0)
 
     if (
-        not args.profile
-        and args.try_auto_save_to_beaker
+        args.try_auto_save_to_beaker
         and accelerator.is_main_process
         and is_beaker_job()
         and len(beaker_config.beaker_dataset_id_urls) > 0
@@ -791,7 +760,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
     ):
         shutil.copytree(args.output_dir, "/output", dirs_exist_ok=True)
 
-    if not args.profile and is_beaker_job() and accelerator.is_main_process and args.try_launch_beaker_eval_jobs:
+    if is_beaker_job() and accelerator.is_main_process and args.try_launch_beaker_eval_jobs:
         launch_ai2_evals_on_weka(
             path=args.output_dir,
             leaderboard_name=args.hf_repo_revision,
@@ -803,7 +772,7 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
             eval_priority=args.eval_priority,
             oe_eval_gpu_multiplier=args.oe_eval_gpu_multiplier,
         )
-    if not args.profile and args.push_to_hub and accelerator.is_main_process:
+    if args.push_to_hub and accelerator.is_main_process:
         model_utils.push_folder_to_hub(args.output_dir, args.hf_repo_id, args.hf_repo_revision)
     accelerator.wait_for_everyone()
     if args.with_tracking:

@@ -86,6 +86,23 @@ class TestDPOLoss(unittest.TestCase):
         self.assertFalse(chosen_rewards.requires_grad)
         self.assertFalse(rejected_rewards.requires_grad)
 
+    def test_reference_pair_mask_keep_mask_flip(self):
+        policy_chosen = torch.tensor([0.0, 0.0, 0.0])
+        policy_rejected = torch.tensor([-1.0, -1.0, -1.0])
+        ref_chosen = torch.tensor([0.0, 0.0, 0.0])
+        ref_rejected = torch.tensor([-1.0, -1.0, -1.0])
+        reference_flip_mask = torch.tensor([1, 0, -1], dtype=torch.int32)
+
+        losses, chosen_rewards, rejected_rewards = dpo_utils.dpo_loss(
+            policy_chosen, policy_rejected, ref_chosen, ref_rejected, reference_flip_mask=reference_flip_mask, beta=0.1
+        )
+
+        self.assertGreater(losses[0].item(), 0.0)
+        self.assertEqual(losses[1].item(), 0.0)
+        self.assertGreater(losses[2].item(), losses[0].item())
+        self.assertEqual(chosen_rewards[1].item(), 0.0)
+        self.assertEqual(rejected_rewards[1].item(), 0.0)
+
 
 class TestSimPOLoss(unittest.TestCase):
     """Tests for simpo_loss function."""
@@ -137,6 +154,31 @@ class TestWPOLoss(unittest.TestCase):
         self.assertEqual(losses.shape, (1, 3))
         self.assertEqual(chosen_rewards.shape, (1, 3))
         self.assertEqual(rejected_rewards.shape, (1, 3))
+
+    def test_reference_pair_mask_keep_mask_flip(self):
+        policy_chosen = torch.tensor([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        policy_rejected = torch.tensor([[-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0]])
+        ref_chosen = torch.tensor([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        ref_rejected = torch.tensor([[-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0]])
+        chosen_mask = torch.tensor([[True, True], [True, True], [True, True]])
+        rejected_mask = torch.tensor([[True, True], [True, True], [True, True]])
+        reference_flip_mask = torch.tensor([1, 0, -1], dtype=torch.int32)
+
+        losses, chosen_rewards, rejected_rewards = dpo_utils.wpo_loss(
+            policy_chosen,
+            policy_rejected,
+            ref_chosen,
+            ref_rejected,
+            reference_flip_mask=reference_flip_mask,
+            beta=0.1,
+            chosen_loss_mask=chosen_mask,
+            rejected_loss_mask=rejected_mask,
+        )
+
+        self.assertTrue(torch.all(losses[1] == 0.0))
+        self.assertTrue(torch.all(chosen_rewards[1] == 0.0))
+        self.assertTrue(torch.all(rejected_rewards[1] == 0.0))
+        self.assertTrue(torch.all(losses[2] > losses[0]))
 
 
 class TestComputeReferenceCacheHash(unittest.TestCase):

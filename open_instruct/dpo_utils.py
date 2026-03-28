@@ -166,18 +166,17 @@ class DatasetConfig:
     reference_logprobs_cache_path: str | None = None
     """The path to a previously computed reference logprobs cache.
 
-    If this is set, the reference logprobs will be loaded from this,
-    then modified according to the loaded dataset.
+    If this is set, the reference logprobs will be loaded from this, then
+    modified according to the loaded dataset.
     The loaded dataset should have:
-      - a "cache_index" column, corresponding to the index of the dataset
+      - a "original_index" column, corresponding to the index of the dataset
         used to compute the reference logprobs. This will be used to index
         into the reference logprobs cache.
-      - a boolean "flipped" column, corresponding to whether the sample was flipped.
-      - If there are new entries which didn't exist in the original dataset,
-        the "cache_index" column should be set to -1,
-        and there should also be a "new_index" column,
-        which is offsetted from the length of the original cache.
-        The reference logprobs will be newly computed. They will not be saved.
+      - a "mask" column with values in [-1, 0, 1], corresponding respectively
+        to flip, mask, keep.
+      - if there are new entries which did not exist in the original dataset,
+        the "original_index" column should be set to -1. Instead, there should
+        be a "new_index" column, starting from 0.
     """
     cache_reference_logprobs_only: bool = False
     """If true, exit after caching and saving the reference logprobs to disk."""
@@ -241,8 +240,6 @@ class CheckpointConfig:
     """How many checkpoints to keep in the output directory. -1 for all."""
     resume_from_checkpoint: str | None = None
     """If the training should continue from a checkpoint folder."""
-    skip_model_save: bool = False
-    """Skip saving the model at the end of training."""
 
 
 @dataclass
@@ -281,20 +278,6 @@ class ModelConfig:
     """Create the model as an empty shell, then materialize parameters when pretrained weights are loaded."""
 
 
-@dataclass
-class ProfilerConfig:
-    """Configuration for profiling."""
-
-    profile: bool = False
-    """Enable torch.profiler for performance analysis. NOTE: This also disables model saving."""
-    warmup_steps: int = 2
-    """Number of training steps to warmup"""
-    profile_steps: int = 2
-    """Number of training steps to profile"""
-    profile_output_dir: str | None = None
-    """Directory to save profiler traces (defaults to output_dir/profiler)"""
-
-
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
@@ -310,7 +293,6 @@ class ExperimentConfig(
     HubConfig,
     CheckpointConfig,
     EvalConfig,
-    ProfilerConfig,
 ):
     """
     Full arguments class for all fine-tuning jobs.
@@ -585,10 +567,8 @@ def append_reference_logprobs_cache(
     rejected_tensor = torch.full((new_dataset_size,), float("-inf"), dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        for batch in tqdm(
-            dataloader, disable=not accelerator.is_local_main_process, desc="Caching reference logprobs"
-        ):
-            new_indices = [idx for idx, cache_idx in enumerate(batch["cache_index"]) if cache_idx == -1]
+        for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process, desc="Caching new logprobs"):
+            new_indices = [i for i, original_idx in enumerate(batch["original_index"]) if original_idx == -1]
             batch_new = {k: v[new_indices] for k, v in batch.items()}
             if use_lora:
                 with accelerator.unwrap_model(model).disable_adapter():
@@ -617,7 +597,8 @@ def append_reference_logprobs_cache(
         tensors={
             "chosen_logps": torch.cat([original_logprobs_cache.tensors["chosen_logps"], chosen_tensor]),
             "rejected_logps": torch.cat([original_logprobs_cache.tensors["rejected_logps"], rejected_tensor]),
-        }
+        },
+        offset=original_logprobs_cache.tensors["chosen_logps"].shape[0],
     )
 
     if dist.is_initialized():
@@ -626,13 +607,43 @@ def append_reference_logprobs_cache(
     return new_cache
 
 
+def _apply_reference_pair_mask(
+    reference_chosen_logps: torch.Tensor,
+    reference_rejected_logps: torch.Tensor,
+    reference_flip_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply keep/mask/flip semantics to reference logprobs."""
+    if reference_flip_mask is None:
+        pair_mask = torch.ones(
+            reference_chosen_logps.shape[0], dtype=reference_chosen_logps.dtype, device=reference_chosen_logps.device
+        )
+        return reference_chosen_logps, reference_rejected_logps, pair_mask
+
+    if reference_flip_mask.ndim != 1:
+        raise ValueError(f"Expected reference_flip_mask to be 1D, got shape {tuple(reference_flip_mask.shape)}")
+
+    pair_mask = (reference_flip_mask != 0).to(dtype=reference_chosen_logps.dtype)
+    flip_mask = reference_flip_mask == -1
+
+    while flip_mask.ndim < reference_chosen_logps.ndim:
+        flip_mask = flip_mask.unsqueeze(-1)
+    while pair_mask.ndim < reference_chosen_logps.ndim:
+        pair_mask = pair_mask.unsqueeze(-1)
+
+    reference_chosen_logps, reference_rejected_logps = (
+        torch.where(flip_mask, reference_rejected_logps, reference_chosen_logps),
+        torch.where(flip_mask, reference_chosen_logps, reference_rejected_logps),
+    )
+    return reference_chosen_logps, reference_rejected_logps, pair_mask
+
+
 def dpo_loss(
     policy_chosen_logps: torch.Tensor,
     policy_rejected_logps: torch.Tensor,
     reference_chosen_logps: torch.Tensor,
     reference_rejected_logps: torch.Tensor,
-    reference_flip_mask: torch.Tensor,
-    beta: float,
+    reference_flip_mask: torch.Tensor | None = None,
+    beta: float = 0.1,
     reference_free: bool = False,
     label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -655,12 +666,8 @@ def dpo_loss(
     Returns:
         A tuple of three tensors: (losses, mean_chosen_rewards, mean_rejected_rewards).
     """
-    # flip the reference chosen and rejected logps
-    # when reference_flip_mask
-
-    reference_chosen_logps, reference_rejected_logps = (
-        torch.where(reference_flip_mask, reference_rejected_logps, reference_chosen_logps),
-        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps),
+    reference_chosen_logps, reference_rejected_logps, pair_mask = _apply_reference_pair_mask(
+        reference_chosen_logps, reference_rejected_logps, reference_flip_mask
     )
 
     pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -675,7 +682,7 @@ def dpo_loss(
     chosen_rewards = (beta * (policy_chosen_logps - reference_chosen_logps)).detach()
     rejected_rewards = (beta * (policy_rejected_logps - reference_rejected_logps)).detach()
 
-    return losses, chosen_rewards, rejected_rewards
+    return losses * pair_mask, chosen_rewards * pair_mask, rejected_rewards * pair_mask
 
 
 def wpo_loss(
@@ -683,10 +690,10 @@ def wpo_loss(
     policy_rejected_logps: torch.Tensor,
     reference_chosen_logps: torch.Tensor,
     reference_rejected_logps: torch.Tensor,
-    reference_flip_mask: torch.Tensor,
-    beta: float,
-    chosen_loss_mask: torch.Tensor,
-    rejected_loss_mask: torch.Tensor,
+    reference_flip_mask: torch.Tensor | None = None,
+    beta: float = 0.1,
+    chosen_loss_mask: torch.Tensor | None = None,
+    rejected_loss_mask: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the Weighted Preference Optimization (WPO) loss.
@@ -709,11 +716,11 @@ def wpo_loss(
         A tuple of (losses, mean_chosen_rewards, mean_rejected_rewards).
     """
 
-    # flip the reference chosen and rejected logps
-    # when reference_flip_mask
-    reference_chosen_logps, reference_rejected_logps = (
-        torch.where(reference_flip_mask, reference_rejected_logps, reference_chosen_logps),
-        torch.where(reference_flip_mask, reference_chosen_logps, reference_rejected_logps),
+    if chosen_loss_mask is None or rejected_loss_mask is None:
+        raise ValueError("chosen_loss_mask and rejected_loss_mask must be provided for WPO loss")
+
+    reference_chosen_logps, reference_rejected_logps, pair_mask = _apply_reference_pair_mask(
+        reference_chosen_logps, reference_rejected_logps, reference_flip_mask
     )
 
     pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -734,7 +741,7 @@ def wpo_loss(
     chosen_rewards = (beta * (policy_chosen_logps - reference_chosen_logps)).detach()
     rejected_rewards = (beta * (policy_rejected_logps - reference_rejected_logps)).detach()
 
-    return losses, chosen_rewards, rejected_rewards
+    return losses * pair_mask, chosen_rewards * pair_mask, rejected_rewards * pair_mask
 
 
 # From https://github.com/princeton-nlp/SimPO/blob/main/scripts/simpo_trainer.py#L560C1-L595C56
@@ -767,7 +774,7 @@ def simpo_loss(
 
 
 def compute_loss(
-    args: DPOConfig,
+    args: ExperimentConfig,
     batch: dict[str, torch.Tensor],
     policy_chosen_logps: torch.Tensor,
     policy_rejected_logps: torch.Tensor,
@@ -775,34 +782,33 @@ def compute_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     loss_type = args.loss_type
 
-    if loss_type in (DPOLossType.dpo, DPOLossType.dpo_norm):
+    if loss_type in (DPOLossType.dpo, DPOLossType.dpo_norm, DPOLossType.wpo):
         assert reference_cache is not None
 
         # Matching the dataset entry with the cache entry,
-        # when args.reference_logprobs_cache_path is not None:
-        #     try the "cache_index" entry first. if that is -1,
+        # If args.reference_logprobs_cache_path is not None:
+        #     try the "original_index" entry first. if that is -1,
         #     then it is a new entry; try "new_index" + offset instead.
-        # Otherwise, just match by the "index".
+        # Else, just match by the "index".
         if args.reference_logprobs_cache_path is not None:
             ref_cache_indices = []
-            for i in range(len(batch["cache_index"])):
-                if batch["cache_index"][i] != -1:
-                    ref_cache_indices.append(batch["cache_index"][i])
+            for i in range(len(batch["original_index"])):
+                if batch["original_index"][i] != -1:
+                    ref_cache_indices.append(batch["original_index"][i])
                 else:
-                    assert reference_cache.offset is not None, (
-                        "New entries are present in the dataset, but reference_cache.offset is not set."
-                    )
+                    assert reference_cache.offset is not None
+                    assert batch["new_index"][i] != -1
                     ref_cache_indices.append(batch["new_index"][i] + reference_cache.offset)
         else:
             ref_cache_indices = list(batch["index"])
         ref_cache_indices = torch.tensor(ref_cache_indices, device=policy_chosen_logps.device)
         ref_logps = reference_cache[ref_cache_indices]
 
-        if "flipped" in batch:
-            reference_flip_mask = torch.tensor(batch["flipped"], dtype=torch.bool, device=policy_chosen_logps.device)
+        if "mask" in batch:
+            reference_flip_mask = batch["mask"].to(device=policy_chosen_logps.device, dtype=torch.int32)
         else:
-            reference_flip_mask = torch.zeros(
-                len(ref_cache_indices), dtype=torch.bool, device=policy_chosen_logps.device
+            reference_flip_mask = torch.ones(
+                len(ref_cache_indices), dtype=torch.int32, device=policy_chosen_logps.device
             )
 
         return dpo_loss(
@@ -825,6 +831,10 @@ def compute_loss(
     elif loss_type == DPOLossType.wpo:
         assert reference_cache is not None
         ref_logps = reference_cache[batch["index"]]
+        if "mask" in batch:
+            reference_flip_mask = batch["mask"].to(device=policy_chosen_logps.device, dtype=torch.int32)
+        else:
+            reference_flip_mask = torch.ones(len(batch["index"]), dtype=torch.int32, device=policy_chosen_logps.device)
         return wpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
@@ -1177,7 +1187,7 @@ class DataCollatorForSeq2SeqDPO(DataCollatorForSeq2Seq):
         if "index" in features[0]:
             result["index"] = torch.tensor([f["index"] for f in features])
 
-        for column in ["cache_index", "new_index", "flipped"]:
+        for column in ["original_index", "mask", "new_index"]:
             if column in features[0]:
                 result[column] = torch.tensor([f[column] for f in features])
 
