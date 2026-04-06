@@ -227,7 +227,8 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
 
     # Make one log on every process with the configuration for debugging.
     logger_utils.setup_logger()
-    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_main_process:
+        logger.info("%s", accelerator.state)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -386,24 +387,31 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
         num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
     )
 
-    # Capture full dataset size by getting it from the dataset. Sharding happens inside the dataloaders, not the dataset, so we're fine to do this.
-    # This is used to allocate tensors for the logprobs cache.
-    original_dataset_size = len(train_dataset)
-
-    # Compute the number of entries with "original_index" column set to -1.
-    # This corresponds to the number of entries that are newly added.
-    # This is used to compute cached logprobs for the new entries.
-    new_dataset_size = 0
-    for ex in train_dataset:
-        if ex.get("original_index", 0) == -1:
-            assert ex.get("new_index") is not None
-            new_dataset_size += 1
-    logger.info(f"Newly added, uncached rows: {new_dataset_size} rows")
-
     if args.max_train_samples is not None:
         max_train_samples = min(len(train_dataset), args.max_train_samples)
         logger.info(f"Limiting training samples to {max_train_samples} from {len(train_dataset)}.")
         train_dataset = train_dataset.select(range(max_train_samples))
+
+    # Capture the size of the dataset we will actually train on.
+    original_dataset_size = len(train_dataset)
+
+    new_dataset_size = 0
+    if "original_index" in train_dataset.column_names:
+        if args.reference_logprobs_cache_path is not None:
+            remapped_new_index = []
+            for original_index in train_dataset["original_index"]:
+                if original_index == -1:
+                    remapped_new_index.append(new_dataset_size)
+                    new_dataset_size += 1
+                else:
+                    remapped_new_index.append(-1)
+
+            if "new_index" in train_dataset.column_names:
+                train_dataset = train_dataset.remove_columns("new_index")
+            train_dataset = train_dataset.add_column("new_index", remapped_new_index)
+        else:
+            new_dataset_size = sum(original_index == -1 for original_index in train_dataset["original_index"])
+    logger.info(f"Newly added, uncached rows: {new_dataset_size} rows")
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -567,6 +575,12 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
         print_gpu_stats(init_gpu_memory)
 
     if args.cache_reference_logprobs_only:
+        if args.loss_type.needs_reference_model and args.reference_logprobs_cache_path is not None:
+            if accelerator.is_main_process:
+                logger.info(f"Saving appended reference logprobs cache to {args.reference_logprobs_cache_path}")
+                reference_cache.to_disk(args.reference_logprobs_cache_path)
+            if dist.is_initialized():
+                dist.barrier()
         return
 
     # Only show the progress bar once on each machine.
@@ -607,7 +621,13 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
                     policy_rejected_logps,
                     reference_cache if args.loss_type.needs_reference_model else None,
                 )
-                loss = losses.mean()
+                valid_pair_mask = None
+                if "mask" in batch:
+                    valid_pair_mask = (batch["mask"] != 0).to(device=losses.device, dtype=losses.dtype)
+                    valid_pairs = valid_pair_mask.sum().clamp_min(1)
+                    loss = losses.sum() / valid_pairs
+                else:
+                    loss = losses.mean()
                 if args.load_balancing_loss:
                     weighted_aux_loss = args.load_balancing_weight * aux_loss
                     loss += weighted_aux_loss
@@ -621,18 +641,26 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
 
                 # We keep track of the loss at each logged step
                 with torch.no_grad():
+                    def batch_mean(values: torch.Tensor) -> torch.Tensor:
+                        if valid_pair_mask is None:
+                            return values.mean()
+                        expanded_mask = valid_pair_mask.to(dtype=values.dtype)
+                        while expanded_mask.ndim < values.ndim:
+                            expanded_mask = expanded_mask.unsqueeze(-1)
+                        return (values * expanded_mask).sum() / expanded_mask.sum().clamp_min(1)
+
                     local_metrics["train_loss"] += loss
                     if args.loss_type.computes_reward_metrics:
-                        average_rewards = ((chosen_rewards + rejected_rewards) / 2).mean()
-                        accuracy = (chosen_rewards > rejected_rewards).float().mean()
-                        margin = (chosen_rewards - rejected_rewards).mean()
-                        local_metrics["rewards/chosen"] += chosen_rewards.mean()
-                        local_metrics["rewards/rejected"] += rejected_rewards.mean()
+                        average_rewards = batch_mean((chosen_rewards + rejected_rewards) / 2)
+                        accuracy_values = (chosen_rewards > rejected_rewards).float()
+                        margin = batch_mean(chosen_rewards - rejected_rewards)
+                        local_metrics["rewards/chosen"] += batch_mean(chosen_rewards)
+                        local_metrics["rewards/rejected"] += batch_mean(rejected_rewards)
                         local_metrics["rewards/average"] += average_rewards
-                        local_metrics["rewards/accuracy"] += accuracy
+                        local_metrics["rewards/accuracy"] += batch_mean(accuracy_values)
                         local_metrics["rewards/margin"] += margin
-                    local_metrics["logps/chosen"] += policy_chosen_logps.mean()
-                    local_metrics["logps/rejected"] += policy_rejected_logps.mean()
+                    local_metrics["logps/chosen"] += batch_mean(policy_chosen_logps)
+                    local_metrics["logps/rejected"] += batch_mean(policy_rejected_logps)
                     if args.load_balancing_loss:
                         local_metrics["aux_loss"] += weighted_aux_loss
 

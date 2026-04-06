@@ -1,37 +1,17 @@
-# Bash commands
-- `uv run pytest`: Run the tests.
-- `make style && make quality` run the linter + formatter.
-- `uv run mkdocs serve`: View the documentation locally at http://127.0.0.1:8000/
-- `uv run mkdocs build`: Build the documentation to the `site/` directory.
+# Requirements
 
+- This project uses `uv` for python environment. Run `source ~/.venv/bin/activate` if you find the venv not activated. Run commands with the option `--active` whenever that makes sense, since this venv path is not the current working directory.
 
+- Unless explicitly asked to change code, do NOT change any code. By default, when the user asks a question, they only want an answer without any actions.
 
-# Workflow
-- Always run the linter and make sure the tests pass before finishing a task.
-- Prefer running single tests, not the whole suite, when developing.
-- To run the `./scripts/train/build_image_and_launch.sh` script, you must commit the current changes.
-- To launch experiment scripts, use the `build_image_and_launch.sh` script, like this: `./scripts/train/build_image_and_launch.sh $SOME_SCRIPT`.
-- For GRPO, we have three test scripts:
-  - `scripts/train/debug/single_gpu_on_beaker.sh`: single GPU, no tools (~8 minutes).
-  - `scripts/train/debug/tool_grpo_fast.sh`: single GPU, with tools (~15 minutes).
-  - `scripts/train/debug/large_test_script.sh`: two 8x GPU nodes, no tools (~32 minutes).
-- For DPO, we have two test scripts:
-  - `scripts/train/debug/dpo.sh`: single GPU.
-  - `scripts/train/debug/large_dpo.sh`: four 8x GPU nodes.
-- To run the `./scripts/train/build_image_and_launch.sh` script, you must commit the current changes.
-- Launch tool use experiments by running `./scripts/train/build_image_and_launch.sh scripts/train/debug/tool_grpo_fast.sh`.
-- Launch multi-node non-tool experiments by running `./scripts/train/build_image_and_launch.sh scripts/train/debug/large_test_script.sh`.
-- Launch DPO experiments by running `./scripts/train/build_image_and_launch.sh scripts/train/debug/dpo.sh`.
-- Launch multi-node DPO experiments by running `./scripts/train/build_image_and_launch.sh scripts/train/debug/medium_dpo.sh`.
-- Launch the GPU tests with `./scripts/train/build_image_and_launch.sh scripts/train/debug/run_gpu_tests.sh`.
-- If you are given a Beaker URL (beaker\.allen\.ai.*) use the Beaker CLI tool to interact with it.
+- When I ask you how to do a certain task, try to sketch out the diffs you propose in code or pseudocode (ideally concrete diffs against the most up-to-date version of the files). DO NOT REPRODUCE A FULL REWRITTEN FILE in your response since this makes it hard for me to understand what changed; instead, show me the diffs. NEVER TOUCH CODE YOU DON'T NEED TO TOUCH.
 
-# Coding conventions
-- Always use `logger = logger_utils.setup_logger(__name__)` for logging.
+- When writing code, you often have a tendency to write bloated, over-cautious (try-except, conditionals), over-engineered (helper functions that are only used once, extra variables performing no real function, classes that are unneeded). This is unacceptable; instead, learn from the style of the code in the current repo, and optimize for READABILITY and SIMPLICITY.
 
-# Documentation
-To verify that documentation changes don't alter the generated output:
-1. Build docs on your branch: `uv run mkdocs build && cp -r site site-branch`
-2. Switch to main branch and build: `cd /path/to/main && uv run mkdocs build`
-3. Compare the builds: `diff -rq site-branch /path/to/main/site`
-4. If no output, the docs are identical. If differences exist, review with: `diff -r site-branch /path/to/main/site`
+- Avoid naming functions and variables with names starting with an underscore (_), even when they are helper functions. Only do this when the function or variable is truly unambiguously local to the scope of the file.
+
+- Oftentimes I will ask you questions mid-implementation or mid-refactor. If you find any obvious inconsistencies and problems with current files, just assume that I'm aware of them, and you should not be sidetracked by investigating those. Only mention problems to me that are subtle and non-obvious.
+
+- When I ask for an explanation of the code or some concept you mention, you should NEVER try to explain it in a pretentiously abstract and condensed way. Instead, ALWAYS explain concepts in plain terms and in clear language, and avoid making things sound convoluted. THIS IS VERY IMPORTANT: DO NOT explain things in a convoluted and abstract style, and instead opt for CLEAR EXAMPLES and plain language.
+
+- Sometimes, I will modify a file after you make changes to the file. ALWAYS make sure to base your analysis on the latest version of the relevant files, and NEVER revert the changes I made unless explicitly told to do so.

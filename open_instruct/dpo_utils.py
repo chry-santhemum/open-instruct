@@ -569,6 +569,8 @@ def append_reference_logprobs_cache(
     with torch.no_grad():
         for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process, desc="Caching new logprobs"):
             new_indices = [i for i, original_idx in enumerate(batch["original_index"]) if original_idx == -1]
+            if not new_indices:
+                continue
             batch_new = {k: v[new_indices] for k, v in batch.items()}
             if use_lora:
                 with accelerator.unwrap_model(model).disable_adapter():
